@@ -4,17 +4,23 @@ use std::time::Duration;
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use rand::Rng;
 
-use crate::geometry::Point;
+use crate::geometry::{Point, closest_point_on_segment};
 use crate::maze::{Maze, MazeConfig, generate};
 
-const PATH_WIDTH: f32 = 9.0;
-const MARKER_RADIUS: f32 = 5.0;
+const TUBE_WIDTH_TO_UNIT: f32 = 0.75;
+const MARKER_RADIUS_TO_TUBE_WIDTH: f32 = 0.3;
+const VISIBLE_BALL_DIAMETERS: f32 = 20.0;
+const FOLLOW_SPRING: f32 = 14.0;
+const VELOCITY_DAMPING: f32 = 2.8;
+const WALL_RESTITUTION: f32 = 0.45;
 
 pub struct MazeApp {
     config: MazeConfig,
     maze: Option<Maze>,
     result_receiver: Option<Receiver<Maze>>,
     generating: bool,
+    ball_position: Option<Point>,
+    ball_velocity: Point,
 }
 
 impl MazeApp {
@@ -25,6 +31,8 @@ impl MazeApp {
             maze: None,
             result_receiver: None,
             generating: false,
+            ball_position: None,
+            ball_velocity: Point::ZERO,
         };
         app.start_generation();
         app
@@ -53,6 +61,8 @@ impl MazeApp {
             .as_ref()
             .and_then(|rx| rx.try_recv().ok());
         if let Some(maze) = result {
+            self.ball_position = Some(maze.nodes[maze.start]);
+            self.ball_velocity = Point::ZERO;
             self.maze = Some(maze);
             self.result_receiver = None;
             self.generating = false;
@@ -77,7 +87,7 @@ impl MazeApp {
 
         ui.separator();
         ui.label("Generation");
-        ui.add(egui::Slider::new(&mut self.config.unit, 5.0..=30.0).text("unit (px)"));
+        ui.add(egui::Slider::new(&mut self.config.unit, 5.0..=30.0).text("generation unit"));
         ui.add(egui::Slider::new(&mut self.config.max_length_units, 1..=20).text("max line units"));
         ui.add(
             egui::Slider::new(&mut self.config.failure_limit, 100..=5_000)
@@ -111,7 +121,7 @@ impl MazeApp {
         });
     }
 
-    fn draw_maze(&self, ui: &mut egui::Ui) {
+    fn draw_maze(&mut self, ui: &mut egui::Ui) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::hover());
         let Some(maze) = &self.maze else {
             painter.text(
@@ -132,11 +142,39 @@ impl MazeApp {
             .map(|point| point.length_squared().sqrt())
             .fold(1.0_f32, f32::max);
         let diameter = maze_radius * 2.0;
-        let scale = (canvas.width() / diameter).min(canvas.height() / diameter);
+        let full_maze_scale = (canvas.width() / diameter).min(canvas.height() / diameter);
+        let ball_diameter_world =
+            maze.unit * TUBE_WIDTH_TO_UNIT * MARKER_RADIUS_TO_TUBE_WIDTH * 2.0;
+        let focused_scale = canvas.width() / (VISIBLE_BALL_DIAMETERS * ball_diameter_world);
+        let scale = focused_scale.max(full_maze_scale);
+        // Centerlines are generated at least one unit apart. Keeping the full
+        // tube width below one scaled unit guarantees separated tubes remain
+        // visually disjoint at every zoom level.
+        let path_width = (maze.unit * scale * TUBE_WIDTH_TO_UNIT).max(1.0);
+        let marker_radius = path_width * MARKER_RADIUS_TO_TUBE_WIDTH;
+        let ball_position = self.ball_position.get_or_insert(maze.nodes[maze.start]);
+        let camera_before_physics = *ball_position;
+        let to_world = |position: Pos2| -> Point {
+            Point::new(
+                camera_before_physics.x + (position.x - canvas.center().x) / scale,
+                camera_before_physics.y + (canvas.center().y - position.y) / scale,
+            )
+        };
+
+        let cursor_target = response.hover_pos().map(to_world);
+        let dt = ui.input(|input| input.stable_dt).min(0.05);
+        advance_ball(
+            ball_position,
+            &mut self.ball_velocity,
+            cursor_target,
+            maze,
+            dt,
+        );
+        let camera_position = *ball_position;
         let to_screen = |point: Point| -> Pos2 {
             Pos2::new(
-                canvas.center().x + point.x * scale,
-                canvas.center().y - point.y * scale,
+                canvas.center().x + (point.x - camera_position.x) * scale,
+                canvas.center().y - (point.y - camera_position.y) * scale,
             )
         };
 
@@ -150,18 +188,23 @@ impl MazeApp {
         for (a, b) in maze.segments() {
             painter.line_segment(
                 [to_screen(a), to_screen(b)],
-                Stroke::new(PATH_WIDTH, path_color),
+                Stroke::new(path_width, path_color),
             );
+        }
+        // egui line segments have flat caps. A half-stroke disc at every vector
+        // node creates round end caps and smooth joins at corners and branches.
+        for &node in &maze.nodes {
+            painter.circle_filled(to_screen(node), path_width * 0.5, path_color);
         }
 
         painter.circle_filled(
-            to_screen(maze.nodes[maze.start]),
-            MARKER_RADIUS,
+            to_screen(*ball_position),
+            marker_radius,
             Color32::from_rgb(52, 211, 153),
         );
         painter.circle_filled(
             to_screen(maze.nodes[maze.end]),
-            MARKER_RADIUS,
+            marker_radius,
             Color32::from_rgb(251, 113, 133),
         );
 
@@ -172,7 +215,9 @@ impl MazeApp {
 impl eframe::App for MazeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive_result();
-        if self.generating {
+        if self.maze.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        } else if self.generating {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
 
@@ -185,6 +230,57 @@ impl eframe::App for MazeApp {
             });
         egui::CentralPanel::default().show(ui, |ui| self.draw_maze(ui));
     }
+}
+
+fn advance_ball(
+    position: &mut Point,
+    velocity: &mut Point,
+    cursor_target: Option<Point>,
+    maze: &Maze,
+    dt: f32,
+) {
+    let tube_radius = maze.unit * TUBE_WIDTH_TO_UNIT * 0.5;
+    let ball_radius = maze.unit * TUBE_WIDTH_TO_UNIT * MARKER_RADIUS_TO_TUBE_WIDTH;
+    let allowed_offset = tube_radius - ball_radius;
+    let substeps = (dt / (1.0 / 120.0)).ceil().clamp(1.0, 8.0) as usize;
+    let step_dt = dt / substeps as f32;
+
+    for _ in 0..substeps {
+        if let Some(target) = cursor_target {
+            *velocity = *velocity + (target - *position) * (FOLLOW_SPRING * step_dt);
+        }
+        *velocity = *velocity * (-VELOCITY_DAMPING * step_dt).exp();
+
+        let max_speed = maze.unit * 20.0;
+        let speed_squared = velocity.length_squared();
+        if speed_squared > max_speed * max_speed {
+            *velocity = *velocity * (max_speed / speed_squared.sqrt());
+        }
+        *position = *position + *velocity * step_dt;
+
+        let Some(closest) = nearest_maze_point(*position, maze) else {
+            *position = maze.nodes[maze.start];
+            *velocity = Point::ZERO;
+            return;
+        };
+        let offset = *position - closest;
+        let distance = offset.length_squared().sqrt();
+        if distance > allowed_offset {
+            let normal = offset * (1.0 / distance);
+            *position = closest + normal * allowed_offset;
+            let outward_speed = velocity.dot(normal);
+            if outward_speed > 0.0 {
+                *velocity = *velocity - normal * ((1.0 + WALL_RESTITUTION) * outward_speed);
+            }
+        }
+    }
+}
+
+fn nearest_maze_point(position: Point, maze: &Maze) -> Option<Point> {
+    maze.edges
+        .iter()
+        .map(|&(a, b)| closest_point_on_segment(position, maze.nodes[a], maze.nodes[b]))
+        .min_by(|a, b| position.distance(*a).total_cmp(&position.distance(*b)))
 }
 
 fn draw_legend(painter: &egui::Painter, rect: Rect) {
@@ -206,4 +302,39 @@ fn draw_legend(painter: &egui::Painter, rect: Rect) {
         egui::FontId::proportional(13.0),
         Color32::LIGHT_GRAY,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moving_ball_remains_inside_tube() {
+        let maze = Maze {
+            boundary: Vec::new(),
+            nodes: vec![Point::ZERO, Point::new(100.0, 0.0)],
+            edges: vec![(0, 1)],
+            unit: 20.0,
+            start: 0,
+            end: 1,
+            solution_units: 1,
+            attempts: 1,
+        };
+        let mut position = Point::new(50.0, 0.0);
+        let mut velocity = Point::ZERO;
+        for _ in 0..120 {
+            advance_ball(
+                &mut position,
+                &mut velocity,
+                Some(Point::new(50.0, 100.0)),
+                &maze,
+                1.0 / 60.0,
+            );
+        }
+
+        let tube_radius = maze.unit * TUBE_WIDTH_TO_UNIT * 0.5;
+        let ball_radius = maze.unit * TUBE_WIDTH_TO_UNIT * MARKER_RADIUS_TO_TUBE_WIDTH;
+        assert!(position.y.abs() <= tube_radius - ball_radius + 1e-4);
+        assert!(velocity.y <= 0.0);
+    }
 }

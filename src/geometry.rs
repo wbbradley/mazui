@@ -77,13 +77,17 @@ pub fn segment_distance(a: Point, b: Point, c: Point, d: Point) -> f32 {
         .min(point_segment_distance(d, a, b))
 }
 
-fn point_segment_distance(p: Point, a: Point, b: Point) -> f32 {
+pub fn closest_point_on_segment(p: Point, a: Point, b: Point) -> Point {
     let ab = b - a;
     if ab.length_squared() < 1e-12 {
-        return p.distance(a);
+        return a;
     }
     let t = ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
-    p.distance(a + ab * t)
+    a + ab * t
+}
+
+fn point_segment_distance(p: Point, a: Point, b: Point) -> f32 {
+    p.distance(closest_point_on_segment(p, a, b))
 }
 
 fn segments_intersect(a: Point, b: Point, c: Point, d: Point) -> bool {

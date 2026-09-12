@@ -32,6 +32,7 @@ pub struct Maze {
     pub boundary: Vec<Point>,
     pub nodes: Vec<Point>,
     pub edges: Vec<(usize, usize)>,
+    pub unit: f32,
     pub start: usize,
     pub end: usize,
     pub solution_units: usize,
@@ -96,6 +97,7 @@ pub fn generate(config: &MazeConfig) -> Maze {
         boundary,
         nodes,
         edges,
+        unit: config.unit,
         start,
         end,
         solution_units,
@@ -132,12 +134,19 @@ fn line_is_clear(
         return false;
     }
 
-    // Branches necessarily touch an existing path at `from`. Trim that first unit
-    // before doing the clearance test; beyond it, the full unit gap is enforced.
+    // A branch necessarily touches the path it grows from. Exempt its first unit
+    // only when testing a segment that actually contains `from`; unrelated
+    // segments must clear the entire candidate line.
     let trimmed_from = from + direction * unit;
-    segments
-        .iter()
-        .all(|&(a, b)| segment_distance(trimmed_from, to, a, b) + 1e-3 >= unit)
+    segments.iter().all(|&(a, b)| {
+        let starts_on_segment = segment_distance(from, from, a, b) < 1e-3;
+        let clearance_start = if starts_on_segment {
+            trimmed_from
+        } else {
+            from
+        };
+        segment_distance(clearance_start, to, a, b) + 1e-3 >= unit
+    })
 }
 
 fn graph_diameter(node_count: usize, edges: &[(usize, usize)]) -> (usize, usize, usize) {
@@ -227,5 +236,19 @@ mod tests {
         let (start, end, distance) = graph_diameter(5, &edges);
         assert_eq!(distance, 3);
         assert!((start == 3 && matches!(end, 0 | 4)) || (end == 3 && matches!(start, 0 | 4)));
+    }
+
+    #[test]
+    fn unrelated_segments_do_not_receive_branch_clearance_exemption() {
+        let boundary = regular_polygon(4, 100.0);
+        let unrelated = [(Point::new(2.0, -20.0), Point::new(2.0, 20.0))];
+        assert!(!line_is_clear(
+            Point::ZERO,
+            Point::new(20.0, 0.0),
+            Point::new(1.0, 0.0),
+            &boundary,
+            &unrelated,
+            10.0,
+        ));
     }
 }
