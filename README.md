@@ -3,6 +3,8 @@
 Mazui is a deterministic, native Rust maze generator. It grows a branching path
 network inside a regular polygon, with every random choice derived from one seed.
 
+![Mazui showing a zoomed maze, player trail, exit marker, and generation controls](docs/mazui.png)
+
 ## Run
 
 ```sh
