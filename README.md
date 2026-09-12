@@ -19,6 +19,10 @@ maze tubes. The view follows the ball and zooms to approximately 20 ball
 diameters across, with the full-polygon view retained as the zoom-out limit. If
 the red exit is off-screen, its marker moves to an inset viewport edge in the
 exact direction of the exit; it returns to its true position when visible.
+The route taken is recorded four times per second and drawn as a dark-green line
+with smooth joins and round end caps, with the latest 200 samples retained.
+Reaching the exit stops the ball and zooms back out to the full polygon so the
+completed route can be reviewed.
 
 ## Model
 

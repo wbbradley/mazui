@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -10,6 +11,8 @@ use crate::maze::{Maze, MazeConfig, generate};
 const TUBE_WIDTH_TO_UNIT: f32 = 0.75;
 const MARKER_RADIUS_TO_TUBE_WIDTH: f32 = 0.3;
 const VISIBLE_BALL_DIAMETERS: f32 = 20.0;
+const TRAIL_SAMPLE_INTERVAL: f32 = 0.25;
+const MAX_TRAIL_SAMPLES: usize = 200;
 const FOLLOW_SPRING: f32 = 14.0;
 const VELOCITY_DAMPING: f32 = 2.8;
 const WALL_RESTITUTION: f32 = 0.45;
@@ -21,6 +24,9 @@ pub struct MazeApp {
     generating: bool,
     ball_position: Option<Point>,
     ball_velocity: Point,
+    trail: VecDeque<Point>,
+    trail_sample_elapsed: f32,
+    completed: bool,
 }
 
 impl MazeApp {
@@ -33,6 +39,9 @@ impl MazeApp {
             generating: false,
             ball_position: None,
             ball_velocity: Point::ZERO,
+            trail: VecDeque::new(),
+            trail_sample_elapsed: 0.0,
+            completed: false,
         };
         app.start_generation();
         app
@@ -61,8 +70,12 @@ impl MazeApp {
             .as_ref()
             .and_then(|rx| rx.try_recv().ok());
         if let Some(maze) = result {
-            self.ball_position = Some(maze.nodes[maze.start]);
+            let start = maze.nodes[maze.start];
+            self.ball_position = Some(start);
             self.ball_velocity = Point::ZERO;
+            self.trail = VecDeque::from([start]);
+            self.trail_sample_elapsed = 0.0;
+            self.completed = false;
             self.maze = Some(maze);
             self.result_receiver = None;
             self.generating = false;
@@ -110,9 +123,14 @@ impl MazeApp {
                 ui.label("Generating in background…");
             });
         } else if let Some(maze) = &self.maze {
-            ui.colored_label(Color32::from_rgb(111, 207, 151), "Ready");
+            if self.completed {
+                ui.colored_label(Color32::from_rgb(52, 211, 153), "Exit reached!");
+            } else {
+                ui.colored_label(Color32::from_rgb(111, 207, 151), "Ready");
+            }
             ui.label(format!("{} path units", maze.edges.len()));
             ui.label(format!("{}-unit longest route", maze.solution_units));
+            ui.label(format!("{} trail samples", self.trail.len()));
             ui.label(format!("{} attempts", maze.attempts));
         }
 
@@ -146,14 +164,17 @@ impl MazeApp {
         let ball_diameter_world =
             maze.unit * TUBE_WIDTH_TO_UNIT * MARKER_RADIUS_TO_TUBE_WIDTH * 2.0;
         let focused_scale = canvas.width() / (VISIBLE_BALL_DIAMETERS * ball_diameter_world);
-        let scale = focused_scale.max(full_maze_scale);
+        let scale = if self.completed {
+            full_maze_scale
+        } else {
+            focused_scale.max(full_maze_scale)
+        };
         // Centerlines are generated at least one unit apart. Keeping the full
         // tube width below one scaled unit guarantees separated tubes remain
         // visually disjoint at every zoom level.
         let path_width = (maze.unit * scale * TUBE_WIDTH_TO_UNIT).max(1.0);
         let marker_radius = path_width * MARKER_RADIUS_TO_TUBE_WIDTH;
-        let ball_position = self.ball_position.get_or_insert(maze.nodes[maze.start]);
-        let camera_before_physics = *ball_position;
+        let camera_before_physics = self.ball_position.unwrap_or(maze.nodes[maze.start]);
         let to_world = |position: Pos2| -> Point {
             Point::new(
                 camera_before_physics.x + (position.x - canvas.center().x) / scale,
@@ -163,14 +184,36 @@ impl MazeApp {
 
         let cursor_target = response.hover_pos().map(to_world);
         let dt = ui.input(|input| input.stable_dt).min(0.05);
-        advance_ball(
+        let mut ball_position = camera_before_physics;
+        if !self.completed {
+            advance_ball(
+                &mut ball_position,
+                &mut self.ball_velocity,
+                cursor_target,
+                maze,
+                dt,
+            );
+            if ball_position.distance(maze.nodes[maze.end]) <= maze.unit * TUBE_WIDTH_TO_UNIT * 0.5
+            {
+                ball_position = maze.nodes[maze.end];
+                self.ball_velocity = Point::ZERO;
+                self.completed = true;
+            }
+        }
+        self.ball_position = Some(ball_position);
+        record_trail_sample(
+            &mut self.trail,
+            &mut self.trail_sample_elapsed,
             ball_position,
-            &mut self.ball_velocity,
-            cursor_target,
-            maze,
             dt,
+            self.completed,
         );
-        let camera_position = *ball_position;
+
+        let camera_position = if self.completed {
+            Point::ZERO
+        } else {
+            ball_position
+        };
         let to_screen = |point: Point| -> Pos2 {
             Pos2::new(
                 canvas.center().x + (point.x - camera_position.x) * scale,
@@ -197,11 +240,25 @@ impl MazeApp {
             painter.circle_filled(to_screen(node), path_width * 0.5, path_color);
         }
 
-        painter.circle_filled(
-            to_screen(*ball_position),
-            marker_radius,
-            Color32::from_rgb(52, 211, 153),
-        );
+        let trail_color = Color32::from_rgb(5, 120, 87);
+        let trail_radius = marker_radius / 3.0;
+        let trail_points: Vec<_> = self
+            .trail
+            .iter()
+            .copied()
+            .chain(std::iter::once(ball_position))
+            .map(to_screen)
+            .collect();
+        for pair in trail_points.windows(2) {
+            painter.line_segment(
+                pair.try_into().unwrap(),
+                Stroke::new(trail_radius * 2.0, trail_color),
+            );
+        }
+        for point in trail_points {
+            painter.circle_filled(point, trail_radius, trail_color);
+        }
+
         let exit_position = to_screen(maze.nodes[maze.end]);
         let fully_visible = response.rect.shrink(marker_radius);
         let exit_marker_position = if fully_visible.contains(exit_position) {
@@ -212,8 +269,17 @@ impl MazeApp {
         };
         painter.circle_filled(
             exit_marker_position,
-            marker_radius,
+            if self.completed {
+                marker_radius * 1.35
+            } else {
+                marker_radius
+            },
             Color32::from_rgb(251, 113, 133),
+        );
+        painter.circle_filled(
+            to_screen(ball_position),
+            marker_radius,
+            Color32::from_rgb(52, 211, 153),
         );
 
         draw_legend(&painter, response.rect);
@@ -289,6 +355,27 @@ fn nearest_maze_point(position: Point, maze: &Maze) -> Option<Point> {
         .iter()
         .map(|&(a, b)| closest_point_on_segment(position, maze.nodes[a], maze.nodes[b]))
         .min_by(|a, b| position.distance(*a).total_cmp(&position.distance(*b)))
+}
+
+fn record_trail_sample(
+    trail: &mut VecDeque<Point>,
+    elapsed: &mut f32,
+    position: Point,
+    dt: f32,
+    force: bool,
+) {
+    *elapsed += dt;
+    if !force && *elapsed < TRAIL_SAMPLE_INTERVAL {
+        return;
+    }
+    *elapsed %= TRAIL_SAMPLE_INTERVAL;
+    if trail.back().is_some_and(|last| *last == position) {
+        return;
+    }
+    trail.push_back(position);
+    while trail.len() > MAX_TRAIL_SAMPLES {
+        trail.pop_front();
+    }
 }
 
 fn ray_to_rect_edge(origin: Pos2, target: Pos2, bounds: Rect) -> Pos2 {
@@ -388,5 +475,27 @@ mod tests {
             ray_to_rect_edge(Pos2::new(50.0, 50.0), target, bounds),
             target
         );
+    }
+
+    #[test]
+    fn trail_samples_quarterly_and_keeps_last_two_hundred() {
+        let mut trail = VecDeque::new();
+        let mut elapsed = 0.0;
+        record_trail_sample(&mut trail, &mut elapsed, Point::new(1.0, 0.0), 0.24, false);
+        assert!(trail.is_empty());
+        record_trail_sample(&mut trail, &mut elapsed, Point::new(2.0, 0.0), 0.01, false);
+        assert_eq!(trail.len(), 1);
+
+        for index in 0..=MAX_TRAIL_SAMPLES {
+            record_trail_sample(
+                &mut trail,
+                &mut elapsed,
+                Point::new(index as f32 + 10.0, 0.0),
+                0.0,
+                true,
+            );
+        }
+        assert_eq!(trail.len(), MAX_TRAIL_SAMPLES);
+        assert_eq!(trail.back(), Some(&Point::new(210.0, 0.0)));
     }
 }
