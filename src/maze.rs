@@ -22,7 +22,7 @@ impl Default for MazeConfig {
             radius: 360.0,
             unit: 14.0,
             max_length_units: 10,
-            failure_limit: 1_000,
+            failure_limit: 5_000,
         }
     }
 }
