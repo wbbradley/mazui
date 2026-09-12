@@ -202,8 +202,16 @@ impl MazeApp {
             marker_radius,
             Color32::from_rgb(52, 211, 153),
         );
+        let exit_position = to_screen(maze.nodes[maze.end]);
+        let fully_visible = response.rect.shrink(marker_radius);
+        let exit_marker_position = if fully_visible.contains(exit_position) {
+            exit_position
+        } else {
+            let indicator_bounds = response.rect.shrink(marker_radius + 12.0);
+            ray_to_rect_edge(canvas.center(), exit_position, indicator_bounds)
+        };
         painter.circle_filled(
-            to_screen(maze.nodes[maze.end]),
+            exit_marker_position,
             marker_radius,
             Color32::from_rgb(251, 113, 133),
         );
@@ -283,6 +291,33 @@ fn nearest_maze_point(position: Point, maze: &Maze) -> Option<Point> {
         .min_by(|a, b| position.distance(*a).total_cmp(&position.distance(*b)))
 }
 
+fn ray_to_rect_edge(origin: Pos2, target: Pos2, bounds: Rect) -> Pos2 {
+    if bounds.contains(target) {
+        return target;
+    }
+
+    let direction = target - origin;
+    if direction.length_sq() < 1e-12 {
+        return origin;
+    }
+
+    let horizontal_t = if direction.x > 0.0 {
+        (bounds.right() - origin.x) / direction.x
+    } else if direction.x < 0.0 {
+        (bounds.left() - origin.x) / direction.x
+    } else {
+        f32::INFINITY
+    };
+    let vertical_t = if direction.y > 0.0 {
+        (bounds.bottom() - origin.y) / direction.y
+    } else if direction.y < 0.0 {
+        (bounds.top() - origin.y) / direction.y
+    } else {
+        f32::INFINITY
+    };
+    origin + direction * horizontal_t.min(vertical_t).max(0.0)
+}
+
 fn draw_legend(painter: &egui::Painter, rect: Rect) {
     let origin = rect.left_bottom() + Vec2::new(18.0, -18.0);
     painter.circle_filled(origin, 5.0, Color32::from_rgb(52, 211, 153));
@@ -336,5 +371,22 @@ mod tests {
         let ball_radius = maze.unit * TUBE_WIDTH_TO_UNIT * MARKER_RADIUS_TO_TUBE_WIDTH;
         assert!(position.y.abs() <= tube_radius - ball_radius + 1e-4);
         assert!(velocity.y <= 0.0);
+    }
+
+    #[test]
+    fn exit_indicator_preserves_direction_at_viewport_edge() {
+        let bounds = Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(90.0, 90.0));
+        let position = ray_to_rect_edge(Pos2::new(50.0, 50.0), Pos2::new(150.0, 100.0), bounds);
+        assert_eq!(position, Pos2::new(90.0, 70.0));
+    }
+
+    #[test]
+    fn visible_exit_indicator_uses_true_position() {
+        let bounds = Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(90.0, 90.0));
+        let target = Pos2::new(20.0, 30.0);
+        assert_eq!(
+            ray_to_rect_edge(Pos2::new(50.0, 50.0), target, bounds),
+            target
+        );
     }
 }

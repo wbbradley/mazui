@@ -16,7 +16,9 @@ worker thread, so the interface remains responsive.
 Move the pointer over the maze to pull the green start ball toward it. The ball
 has damped momentum, bounces softly at walls, and remains fully inside the white
 maze tubes. The view follows the ball and zooms to approximately 20 ball
-diameters across, with the full-polygon view retained as the zoom-out limit.
+diameters across, with the full-polygon view retained as the zoom-out limit. If
+the red exit is off-screen, its marker moves to an inset viewport edge in the
+exact direction of the exit; it returns to its true position when visible.
 
 ## Model
 
